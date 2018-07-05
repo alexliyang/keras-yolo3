@@ -12,7 +12,8 @@ from collections import defaultdict
 
 import numpy as np
 from keras import backend as K
-from keras.layers import (Conv2D, Input, Add, UpSampling2D, Concatenate)
+from keras.layers import (Conv2D, Input, ZeroPadding2D, Add,
+                          UpSampling2D, MaxPooling2D, Concatenate)
 from keras.layers.advanced_activations import LeakyReLU
 from keras.layers.normalization import BatchNormalization
 from keras.models import Model
@@ -29,7 +30,11 @@ parser.add_argument(
     '--plot_model',
     help='Plot generated Keras model and save as image.',
     action='store_true')
-
+parser.add_argument(
+    '-w',
+    '--weights_only',
+    help='Save as Keras weights file instead of model file.',
+    action='store_true')
 
 def unique_config_sections(config_file):
     """Convert all config sections to have unique names.
@@ -66,9 +71,13 @@ def _main(args):
     # Load weights and config.
     print('Loading weights.')
     weights_file = open(weights_path, 'rb')
-    weights_header = np.ndarray(
-        shape=(5, ), dtype='int32', buffer=weights_file.read(20))
-    print('Weights Header: ', weights_header)
+    major, minor, revision = np.ndarray(
+        shape=(3, ), dtype='int32', buffer=weights_file.read(12))
+    if (major*10+minor)>=2 and major<1000 and minor<1000:
+        seen = np.ndarray(shape=(1,), dtype='int64', buffer=weights_file.read(8))
+    else:
+        seen = np.ndarray(shape=(1,), dtype='int32', buffer=weights_file.read(4))
+    print('Weights Header: ', major, minor, revision, seen)
 
     print('Parsing Darknet config.')
     unique_config_file = unique_config_sections(config_path)
@@ -76,9 +85,7 @@ def _main(args):
     cfg_parser.read_file(unique_config_file)
 
     print('Creating Keras model.')
-    image_height = int(cfg_parser['net_0']['height'])
-    image_width = int(cfg_parser['net_0']['width'])
-    input_layer = Input(shape=(image_height, image_width, 3))
+    input_layer = Input(shape=(None, None, 3))
     prev_layer = input_layer
     all_layers = []
 
@@ -96,15 +103,13 @@ def _main(args):
             activation = cfg_parser[section]['activation']
             batch_normalize = 'batch_normalize' in cfg_parser[section]
 
-            # padding='same' is equivalent to Darknet pad=1
-            padding = 'same' if pad == 1 else 'valid'
+            padding = 'same' if pad == 1 and stride == 1 else 'valid'
 
             # Setting weights.
             # Darknet serializes convolutional weights as:
             # [bias/beta, [gamma, mean, variance], conv_weights]
             prev_layer_shape = K.int_shape(prev_layer)
 
-            # TODO: This assumes channel last dim_ordering.
             weights_shape = (size, size, prev_layer_shape[-1], filters)
             darknet_w_shape = (filters, weights_shape[2], size, size)
             weights_size = np.product(weights_shape)
@@ -125,8 +130,6 @@ def _main(args):
                     buffer=weights_file.read(filters * 12))
                 count += 3 * filters
 
-                # TODO: Keras BatchNormalization mistakenly refers to var
-                # as std.
                 bn_weight_list = [
                     bn_weights[0],  # scale gamma
                     conv_bias,  # shift beta
@@ -144,7 +147,6 @@ def _main(args):
             # (out_dim, in_dim, height, width)
             # We would like to set these to Tensorflow order:
             # (height, width, in_dim, out_dim)
-            # TODO: Add check for Theano dim ordering.
             conv_weights = np.transpose(conv_weights, [2, 3, 1, 0])
             conv_weights = [conv_weights] if batch_normalize else [
                 conv_weights, conv_bias
@@ -160,6 +162,9 @@ def _main(args):
                         activation, section))
 
             # Create Conv2D layer
+            if stride>1:
+                # Darknet uses left and top padding instead of 'same' mode
+                prev_layer = ZeroPadding2D(((1,0),(1,0)))(prev_layer)
             conv_layer = (Conv2D(
                 filters, (size, size),
                 strides=(stride, stride),
@@ -194,20 +199,29 @@ def _main(args):
                 all_layers.append(skip_layer)
                 prev_layer = skip_layer
 
+        elif section.startswith('maxpool'):
+            size = int(cfg_parser[section]['size'])
+            stride = int(cfg_parser[section]['stride'])
+            all_layers.append(
+                MaxPooling2D(
+                    pool_size=(size, size),
+                    strides=(stride, stride),
+                    padding='same')(prev_layer))
+            prev_layer = all_layers[-1]
+
         elif section.startswith('shortcut'):
             index = int(cfg_parser[section]['from'])
             activation = cfg_parser[section]['activation']
             assert activation == 'linear', 'Only linear activation supported.'
             all_layers.append(Add()([all_layers[index], prev_layer]))
             prev_layer = all_layers[-1]
-        
+
         elif section.startswith('upsample'):
             stride = int(cfg_parser[section]['stride'])
             assert stride == 2, 'Only stride=2 supported.'
             all_layers.append(UpSampling2D(stride)(prev_layer))
             prev_layer = all_layers[-1]
 
-        # TODO: Further implement needed.
         elif section.startswith('yolo'):
             out_index.append(len(all_layers)-1)
             all_layers.append(None)
@@ -221,10 +235,16 @@ def _main(args):
                 'Unsupported section header type: {}'.format(section))
 
     # Create and save model.
+    if len(out_index)==0: out_index.append(len(all_layers)-1)
     model = Model(inputs=input_layer, outputs=[all_layers[i] for i in out_index])
     print(model.summary())
-    model.save('{}'.format(output_path))
-    print('Saved Keras model to {}'.format(output_path))
+    if args.weights_only:
+        model.save_weights('{}'.format(output_path))
+        print('Saved Keras weights to {}'.format(output_path))
+    else:
+        model.save('{}'.format(output_path))
+        print('Saved Keras model to {}'.format(output_path))
+
     # Check to see if all weights have been read.
     remaining_weights = len(weights_file.read()) / 4
     weights_file.close()
